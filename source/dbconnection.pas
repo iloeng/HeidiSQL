@@ -181,7 +181,7 @@ type
       Rows, Size, Version, AvgRowLen, MaxDataLen, IndexLen, DataLen, DataFree, AutoInc, CheckSum: Int64;
       // Routine options:
       Body, Definer, Returns, DataAccess, Security, ArgTypes: String;
-      Deterministic, RowsAreExact: Boolean;
+      Deterministic, RowsAreExact, IsMaterialized: Boolean;
 
       NodeType, GroupType: TListNodeType;
       constructor Create(OwnerConnection: TDBConnection);
@@ -757,7 +757,6 @@ type
       function GetRowCount(Obj: TDBObject; ForceExact: Boolean=False): Int64; override;
       property LastRawResults: TPGRawResults read FLastRawResults;
       property RegClasses: TOidStringPairs read FRegClasses;
-      function GetTableColumns(Table: TDBObject): TTableColumnList; override;
       function GetTableKeys(Table: TDBObject): TTableKeyList; override;
       function GetTableForeignKeys(Table: TDBObject): TForeignKeyList; override;
   end;
@@ -4220,11 +4219,22 @@ begin
   case Obj.NodeType of
     lntView: begin
       // Prefer pg_catalog tables. See http://www.heidisql.com/forum.php?t=16213#p16685
-      Result := 'CREATE VIEW ' + QuoteIdent(Obj.Name) + ' AS ' + GetVar('SELECT '+QuoteIdent('definition')+
-        ' FROM '+QuoteIdent('pg_views')+
-        ' WHERE '+QuoteIdent('viewname')+'='+EscapeString(Obj.Name)+
-        ' AND '+QuoteIdent('schemaname')+'='+EscapeString(Obj.Schema)
-        );
+      Result := 'CREATE VIEW ' + QuoteIdent(Obj.Name) + ' AS ';
+      if not Obj.IsMaterialized then begin // normal view
+        Result := Result + GetVar('SELECT '+QuoteIdent('definition')+
+          ' FROM '+QuoteIdent('pg_views')+
+          ' WHERE '+QuoteIdent('viewname')+'='+EscapeString(Obj.Name)+
+          ' AND '+QuoteIdent('schemaname')+'='+EscapeString(Obj.Schema)
+          );
+      end
+      else begin // materialized view
+        Result := Result + GetVar('SELECT '+QuoteIdent('definition')+
+          ' FROM '+QuoteIdent('pg_matviews')+
+          ' WHERE '+QuoteIdent('matviewname')+'='+EscapeString(Obj.Name)+
+          ' AND '+QuoteIdent('schemaname')+'='+EscapeString(Obj.Schema)
+          );
+      end;
+
     end;
     lntFunction, lntProcedure: begin
       Result := 'CREATE '+Obj.GetObjType.ToUpper+' '+QuoteIdent(Obj.Name);
@@ -5991,19 +6001,120 @@ var
   TableIdx: Integer;
   ColQuery: TDBQuery;
   Col: TTableColumn;
-  dt, DefText, ExtraText, MaxLen: String;
+  dt, DefText, ExtraText, MaxLen, ColSQL: String;
 begin
   // Generic: query table columns from IS.COLUMNS
   Log(lcDebug, 'Getting fresh columns for '+Table.QuotedDbAndTableName);
   Result := TTableColumnList.Create(True);
-  TableIdx := InformationSchemaObjects.IndexOf('columns');
-  if TableIdx = -1 then begin
-    // No is.columns table available
-    Exit;
+
+  if (FParameters.IsAnyPostgreSQL) and (ServerVersionInt >= 120000) then begin
+    // This uses pg_attribute.attgenerated, which only exists starting in PostgreSQL 12
+    // Todo: outsource such bigger SQL chunks into dbstructures units, together with the FSQLSpecifities array
+    ColSQL :=
+      'SELECT ' +
+      '    n.nspname AS table_schema, ' +
+      '    c.relname AS table_name, ' +
+      '    a.attname AS column_name, ' +
+      '    a.attnum  AS ordinal_position, ' +
+      '    pg_catalog.format_type(a.atttypid, a.atttypmod) AS data_type, ' +
+      // YES/NO like information_schema.is_nullable
+      '    CASE ' +
+      '        WHEN a.attnotnull THEN ''NO'' ' +
+      '        ELSE ''YES'' ' +
+      '    END AS is_nullable, ' +
+      // Character maximum length (in characters)
+      '    CASE ' +
+      '        WHEN (bt.typcategory = ''S'' OR (bt.oid IS NULL AND t.typcategory = ''S'')) ' +
+      '             AND a.atttypmod <> -1 ' +
+      '        THEN a.atttypmod - 4 ' +
+      '        ELSE NULL ' +
+      '    END AS character_maximum_length, ' +
+      // Numeric precision / scale (NULL for non-numeric)
+      '    CASE ' +
+      '        WHEN (bt.typcategory IN (''N'',''F'')) OR (bt.oid IS NULL AND t.typcategory IN (''N'',''F'')) ' +
+      '        THEN ' +
+      '            CASE ' +
+      '                WHEN a.atttypmod = -1 THEN NULL ' +
+      '                ELSE ((a.atttypmod - 4) >> 16)::integer ' +
+      '            END ' +
+      '    END AS numeric_precision, ' +
+      '    CASE ' +
+      '        WHEN (bt.typcategory IN (''N'',''F'')) OR (bt.oid IS NULL AND t.typcategory IN (''N'',''F'')) ' +
+      '        THEN ' +
+      '            CASE ' +
+      '                WHEN a.atttypmod = -1 THEN NULL ' +
+      '                ELSE ((a.atttypmod - 4) & 65535)::integer ' +
+      '            END ' +
+      '    END AS numeric_scale, ' +
+      // Datetime precision (for time/timestamp/interval)
+      '    CASE ' +
+      '        WHEN (bt.typcategory = ''D'' OR (bt.oid IS NULL AND t.typcategory = ''D'')) ' +
+      '             AND a.atttypmod <> -1 ' +
+      '        THEN a.atttypmod ' +
+      '        ELSE NULL ' +
+      '    END AS datetime_precision, ' +
+      // Character set name: PostgreSQL has one per DB; mimic information_schema
+      '    CASE ' +
+      '        WHEN (bt.typcategory = ''S'' OR (bt.oid IS NULL AND t.typcategory = ''S'')) ' +
+      '        THEN current_database() ' +
+      '        ELSE NULL ' +
+      '    END AS character_set_name, ' +
+      // Collation name for collatable columns
+      '    CASE ' +
+      '        WHEN (bt.typcategory = ''S'' OR (bt.oid IS NULL AND t.typcategory = ''S'')) ' +
+      '        THEN ' +
+      '            CASE ' +
+      '                WHEN a.attcollation <> t.typcollation ' +
+      '                THEN coll.collname ' +
+      '                ELSE NULL ' +
+      '            END ' +
+      '        ELSE NULL ' +
+      '    END AS collation_name, ' +
+      // Default expression for non-generated columns
+      '    CASE ' +
+      '        WHEN a.attgenerated = '''' AND a.atthasdef ' +
+      '        THEN pg_get_expr(ad.adbin, ad.adrelid) ' +
+      '        ELSE NULL ' +
+      '    END AS column_default, ' +
+      // Generation expression for generated columns
+      '    CASE ' +
+      '        WHEN a.attgenerated <> '''' AND a.atthasdef ' +
+      '        THEN pg_get_expr(ad.adbin, ad.adrelid) ' +
+      '        ELSE NULL ' +
+      '    END AS generation_expression, ' +
+      '    d.description AS column_comment ' +
+      'FROM pg_catalog.pg_class     AS c ' +
+      'JOIN pg_catalog.pg_namespace AS n  ON n.oid      = c.relnamespace ' +
+      'JOIN pg_catalog.pg_attribute AS a  ON a.attrelid = c.oid ' +
+      'JOIN pg_catalog.pg_type      AS t  ON t.oid      = a.atttypid ' +
+      'LEFT JOIN pg_catalog.pg_type AS bt ON bt.oid     = t.typbasetype ' +
+      'LEFT JOIN pg_catalog.pg_attrdef AS ad ' +
+      '       ON ad.adrelid = a.attrelid ' +
+      '      AND ad.adnum   = a.attnum ' +
+      'LEFT JOIN pg_catalog.pg_description AS d ' +
+      '       ON d.objoid   = a.attrelid ' +
+      '      AND d.objsubid = a.attnum ' +
+      'LEFT JOIN pg_catalog.pg_collation AS coll ' +
+      '       ON coll.oid   = a.attcollation ' +
+      'WHERE n.nspname = ' + EscapeString(Table.Schema) + ' ' +
+      '  AND a.attnum > 0 ' +
+      '  AND NOT a.attisdropped ' +
+      '  AND c.relname = ' + EscapeString(Table.Name) + ' ' +
+      'ORDER BY ordinal_position';
+  end
+
+  else begin
+    TableIdx := InformationSchemaObjects.IndexOf('columns');
+    if TableIdx = -1 then begin
+      // No is.columns table available
+      Exit;
+    end;
+    ColSQL := 'SELECT * FROM '+QuoteIdent(InfSch)+'.'+QuoteIdent(InformationSchemaObjects[TableIdx])+
+      ' WHERE '+Table.SchemaClauseIS('TABLE')+' AND TABLE_NAME='+EscapeString(Table.Name)+
+      ' ORDER BY ORDINAL_POSITION';
   end;
-  ColQuery := GetResults('SELECT * FROM '+QuoteIdent(InfSch)+'.'+QuoteIdent(InformationSchemaObjects[TableIdx])+
-    ' WHERE '+Table.SchemaClauseIS('TABLE')+' AND TABLE_NAME='+EscapeString(Table.Name)+
-    ' ORDER BY ORDINAL_POSITION');
+  ColQuery := GetResults(ColSQL);
+
   while not ColQuery.Eof do begin
     Col := TTableColumn.Create(Self);
     Result.Add(Col);
@@ -6230,34 +6341,6 @@ begin
     on E:EDbError do;
   end;
 
-end;
-
-function TPgConnection.GetTableColumns(Table: TDBObject): TTableColumnList;
-var
-  Comments: TDBQuery;
-  TableCol: TTableColumn;
-begin
-  Result := inherited;
-  // Column comments in Postgre. See issue #859
-  // Todo: add current schema to WHERE clause?
-  Comments := GetResults('SELECT a.attname AS column, des.description AS comment'+
-    ' FROM pg_attribute AS a, pg_description AS des, pg_class AS pgc'+
-    ' WHERE'+
-    '     pgc.oid = a.attrelid'+
-    '     AND des.objoid = pgc.oid'+
-    '     AND pg_table_is_visible(pgc.oid)'+
-    '     AND pgc.relname = '+EscapeString(Table.Name)+
-    '     AND a.attnum = des.objsubid'
-    );
-  while not Comments.Eof do begin
-    for TableCol in Result do begin
-      if TableCol.Name = Comments.Col('column') then begin
-        TableCol.Comment := Comments.Col('comment');
-        Break;
-      end;
-    end;
-    Comments.Next;
-  end;
 end;
 
 function TSQLiteConnection.GetTableColumns(Table: TDBObject): TTableColumnList;
@@ -7692,7 +7775,7 @@ begin
       'FROM pg_proc p '+
       'JOIN pg_namespace n ON n.oid = p.pronamespace '+
       'WHERE n.nspname = '+EscapeString(db)+' '+
-      '  AND p.prokind IN (''f'',''p'') '
+      '  AND '+ProKindClause+' IN (''f'',''p'') '
       );
   except
     on E:EDbError do;
@@ -7716,10 +7799,14 @@ begin
       tp := Results.Col('object_kind', True);
       if tp = 'r' then
         obj.NodeType := lntTable
-      else if tp = 'v' then
-        obj.NodeType := lntView
-      else if tp = 'm' then
-        obj.NodeType := lntView
+      else if tp = 'v' then begin
+        obj.NodeType := lntView;
+        obj.IsMaterialized := False;
+      end
+      else if tp = 'm' then begin
+        obj.NodeType := lntView;
+        obj.IsMaterialized := True;
+      end
       else if tp = 'f' then
         obj.NodeType := lntFunction
       else if tp = 'p' then
@@ -10492,6 +10579,7 @@ end;
 
 constructor TDBObject.Create(OwnerConnection: TDBConnection);
 begin
+  // Take care, when adding properties here, add them in Assign() below as well
   Name := '';
   Schema := '';
   Database := '';
@@ -10522,6 +10610,7 @@ begin
   ArgTypes := '';
   Deterministic := False;
   RowsAreExact := False;
+  IsMaterialized := False;
   NodeType := lntNone;
   GroupType := lntNone;
   FCreateCode := '';
@@ -10567,6 +10656,7 @@ begin
     ArgTypes := s.ArgTypes;
     Deterministic := s.Deterministic;
     RowsAreExact := s.RowsAreExact;
+    IsMaterialized := s.IsMaterialized;
     NodeType := s.NodeType;
     GroupType := s.GroupType;
     FCreateCode := s.FCreateCode;
