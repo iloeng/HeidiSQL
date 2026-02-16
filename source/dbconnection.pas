@@ -746,7 +746,6 @@ type
       function GetLastErrorCode: Cardinal; override;
       function GetLastErrorMsg: String; override;
       function GetAllDatabases: TStringList; override;
-      function GetCollationList: TStringList; override;
       function GetCharsetTable: TDBQuery; override;
       procedure FetchDbObjects(db: String; var Cache: TDBObjectList); override;
     public
@@ -5541,14 +5540,6 @@ begin
     Result.Add(c.Col('Collation'));
     c.Next;
   end;
-end;
-
-
-function TSQLiteConnection.GetCollationList: TStringList;
-begin
-  // See https://www.sqlite.org/datatype3.html#collation_sequence_examples
-  Result := TStringList.Create;
-  Result.CommaText := 'nocase,binary,rtrim';
 end;
 
 

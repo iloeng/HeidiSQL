@@ -423,6 +423,8 @@ begin
     qEnableForeignKeyChecks: Result := '';
     qForeignKeyDrop: Result := 'DROP FOREIGN KEY %s';
     qGetTableColumns: Result := 'SELECT * FROM pragma_table_xinfo(%s, %s)';
+    // See https://www.sqlite.org/datatype3.html#collation_sequence_examples
+    qGetCollations: Result := 'SELECT name AS "Collation", '''' AS "Charset", '''' AS "Id", '''' AS "Default", '''' AS "Compiled", ''1'' AS Sortlen from pragma_collation_list';
     else Result := inherited;
   end;
 end;
