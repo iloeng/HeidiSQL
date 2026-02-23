@@ -1532,6 +1532,7 @@ begin
   VT.EndUpdate;
   VT.TextMargin := 6;
   VT.Margin := 2;
+  VT.DefaultText := '-'; // "Node" by default
   // Disable hottracking in non-Vista mode, looks ugly in XP, but nice in Vista
   if (toUseExplorerTheme in VT.TreeOptions.PaintOptions) and (Win32MajorVersion >= 6) then
     VT.TreeOptions.PaintOptions := VT.TreeOptions.PaintOptions + [toHotTrack]
