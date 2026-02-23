@@ -2092,7 +2092,7 @@ begin
         Data := DBObj.Connection.GetResults(
           DBObj.Connection.ApplyLimitClause(
             'SELECT',
-            '* FROM '+DBObj.QuotedDbAndTableName + OrderBy,
+            '/* '+APPNAME+' '+MainForm.AppVersion+' */ * FROM '+DBObj.QuotedDbAndTableName + OrderBy,
             Limit,
             Offset)
           );
