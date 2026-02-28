@@ -541,6 +541,7 @@ begin
     comboTheme.Items.Add(Styles[i]);
   end;
   comboTheme.ItemIndex := comboTheme.Items.IndexOf(AppSettings.GetDefaultString(asTheme));
+  lblTheme.Caption := lblTheme.Caption + ' ('+UpperCase(_('deprecated'))+')';
 
   // Populate icon pack dropdown from image collections on main form
   comboIconPack.Items.Clear;
